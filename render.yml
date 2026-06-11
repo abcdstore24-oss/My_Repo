@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: demo
+    runtime: python
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps
+    startCommand: python demo.py
+    envVars:
+      - key: TARGET_URL
+        sync: false
+      - key: USERNAME
+        sync: false
+      - key: SUCCESS_KEYWORD
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
